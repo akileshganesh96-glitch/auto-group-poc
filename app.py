@@ -168,6 +168,19 @@ if uploaded_file:
         "inventory": ["inventory", "raw", "finished goods"],
     }
 
+    category_triggers = {
+    "revenue": ["revenue", "sales"],
+    "salary": ["payroll", "salary", "wages"],
+    "wage": ["payroll", "salary", "wages"],
+    "cogs": ["cost of sales", "cost of revenue"],
+    "cost of goods": ["cost of sales", "cost of revenue"],
+    "depreciation": ["depreciation"],
+    "interest": ["interest"],
+    "tax": ["tax"],
+    "debt": ["loan", "debt", "borrow", "notes payable"],
+    "loan": ["loan", "debt", "borrow", "notes payable"], 
+    }
+
     # -------------------------------
     # CANDIDATE GENERATION (Lightweight)
     # -------------------------------
@@ -220,6 +233,26 @@ if uploaded_file:
                 "score": score
             })
             
+        # ---- Category recall guardrail ----
+        extra_candidates = []
+
+        for trigger, hints in category_triggers.items():
+            if trigger in account_text:
+                for i, name in enumerate(subgroup_names):
+                    if any(h in name.lower() for h in hints):
+
+                        # avoid duplicates
+                        if not any(c["subgroup_id"] == subgroup_ids[i] for c in candidates):
+
+                            extra_candidates.append({
+                                "subgroup_id": subgroup_ids[i],
+                                "subgroup_name": subgroup_names[i],
+                                "score": 0.35  # medium baseline so it enters shortlist
+                            })
+
+        # Add only a few to avoid flooding
+        candidates.extend(extra_candidates[:2])
+        
         candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
 
         score_gap = None
@@ -238,3 +271,114 @@ if uploaded_file:
 
     st.subheader("Candidate Generation Preview")
     st.dataframe(candidate_df.head(20))
+
+    import os
+    from dotenv import load_dotenv
+    from openai import OpenAI
+
+    load_dotenv()
+    client = OpenAI()
+
+
+    # ---- Pick ambiguous rows only ----
+    ambiguous = candidate_df[candidate_df["Score Gap"] < 0.1].copy().reset_index(drop=True)
+
+    st.write(f"Ambiguous rows sent to LLM: {len(ambiguous)}")
+
+
+    # ---- Structured LLM referee ----
+
+    def build_batch_payload(rows):
+        payload = []
+
+        for i, r in rows.iterrows():
+            payload.append({
+                "id": int(i),
+                "account": r["Account Name"],
+                "candidates": r["All Candidates"]
+            })
+
+        return payload
+
+
+    if len(ambiguous) > 0:
+
+        payload = build_batch_payload(ambiguous)
+
+        prompt = f"""
+        You are an accounting expert.
+
+        For each item choose the best subgroup from candidates.
+        If none fit, subgroup = NONE.
+
+        Return JSON array with:
+        id
+        subgroup
+        confidence (high, moderate, low)
+        rationale (one short sentence)
+
+        Data:
+        {payload}
+        """
+
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+            temperature=0
+        )
+
+        text = response.output[0].content[0].text
+
+        st.subheader("Structured LLM Response")
+        st.code(text, language="json")
+        
+        import json
+
+        clean_text = text.strip()
+
+        if clean_text.startswith("```"):
+            clean_text = clean_text.split("```")[1]
+            if clean_text.startswith("json"):
+                clean_text = clean_text[4:].strip()
+
+        try:
+            llm_results = json.loads(clean_text)
+        except:
+            llm_results = []   
+
+        def compute_confidence(score_gap, subgroup, low_signal):
+
+            if subgroup == "NONE":
+                return "low"
+
+            if score_gap is not None and score_gap > 0.15:
+                return "high"
+
+            if low_signal:
+                return "low"
+
+            return "moderate"
+
+        final_rows = []
+
+        for item in llm_results:
+
+            row = ambiguous.loc[item["id"]]
+
+            confidence = compute_confidence(
+                row["Score Gap"],
+                item["subgroup"],
+                row.get("low_signal_flag", False)
+            )
+
+            final_rows.append({
+                "Account": row["Account Name"],
+                "Chosen Subgroup": item["subgroup"],
+                "Confidence": confidence,
+                "Rationale": item["rationale"]
+            })
+
+        final_df = pd.DataFrame(final_rows)
+
+    st.subheader("Final Mapping Preview")
+    st.dataframe(final_df)
