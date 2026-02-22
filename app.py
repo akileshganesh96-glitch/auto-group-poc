@@ -1,5 +1,9 @@
 import streamlit as st
 import pandas as pd
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 st.title("TB Auto Group POC")
 
@@ -7,8 +11,11 @@ st.title("TB Auto Group POC")
 # CoA PREPROCESSING (Pass 1)
 # -------------------------------
 
+from pathlib import Path
+
 # Path to fixed CoA file
-coa_path = "data/data/Univ Grouping List Sample.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+coa_path = BASE_DIR / "data" / "data" / "Univ Grouping List Sample.xlsx"
 
 # Load raw CoA
 coa_raw = pd.read_excel(coa_path)
@@ -49,13 +56,16 @@ else:
 subgroup_lookup = {}
 
 for _, row in coa_sub.iterrows():
-    subgroup_lookup[row["Subgroup ID"]] = {
+    sub_id = int(row["Subgroup ID"])
+    subgroup_lookup[sub_id] = {
         "subgroup_name": row["Subgroup"],
         "group": row["Group"],
         "class": row["Class"],
         "type": row["Type"],
     }
 
+st.write("Sample lookup keys:", list(subgroup_lookup.keys())[:5])
+st.write("Key type:", type(list(subgroup_lookup.keys())[0]))
 
 # ---- STEP 5: Create subgroup description text ----
 # This text will later be used for embeddings + LLM context
@@ -81,17 +91,13 @@ uploaded_file = st.file_uploader("Upload Trial Balance (Excel)", type=["xlsx"])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
+    
     st.subheader("Preview")
     st.dataframe(df)
 
 # -------------------------------
 # FEATURE EXTRACTION (Pass 2)
 # -------------------------------
-
-if uploaded_file:
-
-    df = pd.read_excel(uploaded_file)
-
     # Normalize account name for analysis
     df["account_name_clean"] = (
         df["Account Name"]
@@ -264,7 +270,10 @@ if uploaded_file:
             "Top Candidate": candidates[0]["subgroup_name"],
             "Top Score": candidates[0]["score"],
             "Score Gap": score_gap,
-            "All Candidates": [c["subgroup_name"] for c in candidates]
+            "All Candidates": [
+                {"id": c["subgroup_id"], "name": c["subgroup_name"]}
+                for c in candidates
+            ]
         })
 
     candidate_df = pd.DataFrame(candidate_rows)
@@ -273,6 +282,7 @@ if uploaded_file:
     st.dataframe(candidate_df.head(20))
 
     import os
+    st.write("API key loaded:", bool(os.getenv("OPENAI_API_KEY")))
     from dotenv import load_dotenv
     from openai import OpenAI
 
@@ -284,7 +294,8 @@ if uploaded_file:
     ambiguous = candidate_df[candidate_df["Score Gap"] < 0.1].copy().reset_index(drop=True)
 
     st.write(f"Ambiguous rows sent to LLM: {len(ambiguous)}")
-
+    st.write("First ambiguous candidate IDs:",
+         [c["id"] for c in ambiguous.iloc[0]["All Candidates"]])
 
     # ---- Structured LLM referee ----
 
@@ -295,13 +306,18 @@ if uploaded_file:
             payload.append({
                 "id": int(i),
                 "account": r["Account Name"],
-                "candidates": r["All Candidates"]
+                "candidates": r["All Candidates"]  # now id+name
             })
 
         return payload
 
 
     if len(ambiguous) > 0:
+
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("API key missing — LLM disabled")
+            st.stop()
+
 
         payload = build_batch_payload(ambiguous)
 
@@ -313,9 +329,10 @@ if uploaded_file:
 
         Return JSON array with:
         id
-        subgroup
+        subgroup_id (must be one of candidate ids or NONE)
         confidence (high, moderate, low)
-        rationale (one short sentence)
+        rationale (one short sentence explaining why this candidate is better than the others)
+        Choose using subgroup_id, not subgroup name.
 
         Data:
         {payload}
@@ -367,13 +384,33 @@ if uploaded_file:
 
             confidence = compute_confidence(
                 row["Score Gap"],
-                item["subgroup"],
+                item["subgroup_id"],
                 row.get("low_signal_flag", False)
             )
 
+           # normalize ID coming from LLM
+            sub_id = item["subgroup_id"]
+
+            if sub_id == "NONE":
+                sub_id_int = None
+            else:
+                sub_id_int = int(sub_id)
+
+            st.write("Chosen ID:", sub_id_int)
+            st.write("Exists in lookup:", sub_id_int in subgroup_lookup)
+
+            # resolve name via lookup
+            sub_name = (
+                "NONE"
+                if sub_id_int is None
+                else subgroup_lookup.get(sub_id_int, {}).get("subgroup_name", "UNKNOWN")
+            )
+
+            # append row
             final_rows.append({
                 "Account": row["Account Name"],
-                "Chosen Subgroup": item["subgroup"],
+                "Chosen Subgroup": sub_name,
+                "Subgroup ID": "NONE" if sub_id_int is None else sub_id_int,
                 "Confidence": confidence,
                 "Rationale": item["rationale"]
             })
