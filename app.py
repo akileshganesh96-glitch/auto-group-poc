@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 import os
+import json
 
 load_dotenv()
 
@@ -80,7 +81,6 @@ coa_sub["description"] = (
     + coa_sub["Type"]
 )
 
-
 # ---- STEP 6: Show cleaned subgroup universe ----
 st.subheader("Valid Subgroups (Engine Target Space)")
 st.write(f"Total subgroups: {len(coa_sub)}")
@@ -95,6 +95,46 @@ if uploaded_file:
     st.subheader("Preview")
     st.dataframe(df)
 
+# ---- Unified category signal config ----
+    CATEGORY_SIGNALS = {
+        "revenue": {
+            "triggers": ["revenue", "sales"],
+            "hints": ["revenue", "sales"],
+        },
+        "payroll": {
+            "triggers": ["salary", "wages", "payroll"],
+            "hints": ["payroll", "salary", "wages"],
+        },
+        "cogs": {
+            "triggers": ["cost of sales", "cost of goods"],
+            "hints": ["cost of sales", "cost of goods"],
+        },
+        "depreciation": {
+            "triggers": ["depreciation"],
+            "hints": ["depreciation"],
+        },
+        "interest": {
+            "triggers": ["interest"],
+            "hints": ["interest"],
+        },
+        "tax": {
+            "triggers": ["tax"],
+            "hints": ["tax"],
+        },
+        "debt": {
+            "triggers": ["loan", "debt", "borrow", "notes payable"],
+            "hints": ["loan", "debt", "borrow", "notes payable"],
+        },
+        "inventory": {
+            "triggers": ["inventory", "raw", "finished goods"],
+            "hints": ["inventory", "raw", "finished goods"],
+        },
+        "rent": {
+            "triggers": ["rent"],
+            "hints": ["rent"],
+        },
+    }
+
 # -------------------------------
 # FEATURE EXTRACTION (Pass 2)
 # -------------------------------
@@ -107,10 +147,13 @@ if uploaded_file:
     )
 
     # ---- Keyword detection (very simple starter list) ----
-    keywords = ["rent", "salary", "insurance", "advance", "deposit", "loan"]
-
     def find_keywords(text):
-        return [k for k in keywords if k in text]
+        found = []
+        for cat in CATEGORY_SIGNALS.values():
+            for w in cat["triggers"]:
+                if w in text:
+                    found.append(w)
+        return found
 
     df["keywords_found"] = df["account_name_clean"].apply(find_keywords)
 
@@ -159,34 +202,6 @@ if uploaded_file:
         ].head(20)
     )
 
-    # Accounting keyword → subgroup hint words
-    accounting_boosts = {
-        "revenue": ["revenue", "sales"],
-        "sale": ["revenue", "sales"],
-        "salary": ["payroll", "salary", "wages"],
-        "wage": ["payroll", "salary", "wages"],
-        "cogs": ["cost of sales", "cost of goods"],
-        "cost of goods": ["cost of sales"],
-        "depreciation": ["depreciation"],
-        "interest": ["interest"],
-        "tax": ["tax"],
-        "rent": ["rent"],
-        "inventory": ["inventory", "raw", "finished goods"],
-    }
-
-    category_triggers = {
-    "revenue": ["revenue", "sales"],
-    "salary": ["payroll", "salary", "wages"],
-    "wage": ["payroll", "salary", "wages"],
-    "cogs": ["cost of sales", "cost of revenue"],
-    "cost of goods": ["cost of sales", "cost of revenue"],
-    "depreciation": ["depreciation"],
-    "interest": ["interest"],
-    "tax": ["tax"],
-    "debt": ["loan", "debt", "borrow", "notes payable"],
-    "loan": ["loan", "debt", "borrow", "notes payable"], 
-    }
-
     # -------------------------------
     # CANDIDATE GENERATION (Lightweight)
     # -------------------------------
@@ -220,44 +235,53 @@ if uploaded_file:
         candidates = []
 
         for idx in top_idx:
-            score = float(sims[idx])
-
-            # ---- Accounting keyword boost ----
-            for trigger, hints in accounting_boosts.items():
-                if trigger in account_text:
-                    if any(h in subgroup_names[idx].lower() for h in hints):
-                        score += 0.25
-
-            # ---- lifecycle boost ----
-            if row["lifecycle_flag"]:
-                if any(w in subgroup_names[idx].lower() for w in ["prepaid", "accrued", "deferred"]):
-                    score += 0.2
-
+            
             candidates.append({
                 "subgroup_id": subgroup_ids[idx],
                 "subgroup_name": subgroup_names[idx],
-                "score": score
+                "score": float(sims[idx])   # ✅ base score
             })
             
         # ---- Category recall guardrail ----
         extra_candidates = []
 
-        for trigger, hints in category_triggers.items():
-            if trigger in account_text:
-                for i, name in enumerate(subgroup_names):
-                    if any(h in name.lower() for h in hints):
-
-                        # avoid duplicates
-                        if not any(c["subgroup_id"] == subgroup_ids[i] for c in candidates):
-
-                            extra_candidates.append({
-                                "subgroup_id": subgroup_ids[i],
-                                "subgroup_name": subgroup_names[i],
-                                "score": 0.35  # medium baseline so it enters shortlist
-                            })
+        for cat in CATEGORY_SIGNALS.values():
+            if any(t in account_text for t in cat["triggers"]):
+                # ensure subgroup with hint words appears in candidates
+                for idx2, name in enumerate(subgroup_names):
+                    if any(h in name.lower() for h in cat["hints"]):
+                        extra_candidates.append({
+                            "subgroup_id": subgroup_ids[idx2],
+                            "subgroup_name": subgroup_names[idx2],
+                            "score": 0.05  # small base score so it survives shortlist
+                        })
 
         # Add only a few to avoid flooding
         candidates.extend(extra_candidates[:2])
+
+        # dedupe
+        seen = {}
+        for c in candidates:
+            sid = c["subgroup_id"]
+            if sid not in seen or c["score"] > seen[sid]["score"]:
+                seen[sid] = c
+        candidates = list(seen.values())
+
+        # ranking loop with category and lifecycle boosts
+        for c in candidates:
+
+            idx_name = c["subgroup_name"].lower()
+
+            # category boost
+            for cat in CATEGORY_SIGNALS.values():
+                if any(t in account_text for t in cat["triggers"]):
+                    if any(h in idx_name for h in cat["hints"]):
+                        c["score"] += 0.25
+
+            # lifecycle boost
+            if row["lifecycle_flag"]:
+                if any(w in idx_name for w in ["prepaid", "accrued", "deferred"]):
+                    c["score"] += 0.2
         
         candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
 
@@ -268,6 +292,7 @@ if uploaded_file:
         candidate_rows.append({
             "Account Name": row["Account Name"],
             "Top Candidate": candidates[0]["subgroup_name"],
+            "Top Candidate ID": candidates[0]["subgroup_id"],
             "Top Score": candidates[0]["score"],
             "Score Gap": score_gap,
             "All Candidates": [
@@ -280,13 +305,11 @@ if uploaded_file:
 
     st.subheader("Candidate Generation Preview")
     st.dataframe(candidate_df.head(20))
-
-    import os
+    
     st.write("API key loaded:", bool(os.getenv("OPENAI_API_KEY")))
-    from dotenv import load_dotenv
+
     from openai import OpenAI
 
-    load_dotenv()
     client = OpenAI()
 
 
@@ -311,14 +334,14 @@ if uploaded_file:
 
         return payload
 
+    llm_results = []
 
     if len(ambiguous) > 0:
 
         if not os.getenv("OPENAI_API_KEY"):
             st.error("API key missing — LLM disabled")
             st.stop()
-
-
+          
         payload = build_batch_payload(ambiguous)
 
         prompt = f"""
@@ -329,9 +352,9 @@ if uploaded_file:
 
         Return JSON array with:
         id
-        subgroup_id (must be one of candidate ids or NONE)
+        subgroup_id (must be EXACTLY one of candidate ids or NONE)
         confidence (high, moderate, low)
-        rationale (one short sentence explaining why this candidate is better than the others)
+        rationale (one short sentence explaining why this candidate is best fit for the account.)
         Choose using subgroup_id, not subgroup name.
 
         Data:
@@ -339,18 +362,23 @@ if uploaded_file:
         """
 
         response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=prompt,
-            temperature=0
+            model="gpt-4o-mini",
+            temperature=0,
+            input=prompt
         )
 
-        text = response.output[0].content[0].text
+        text = ""
 
+        for item in response.output:
+            if item.type == "message":
+                for c in item.content:
+                    if c.type == "output_text":
+                        text += c.text
+
+        # Parse JSON (no markdown cleaning needed now)
         st.subheader("Structured LLM Response")
         st.code(text, language="json")
         
-        import json
-
         clean_text = text.strip()
 
         if clean_text.startswith("```"):
@@ -415,7 +443,75 @@ if uploaded_file:
                 "Rationale": item["rationale"]
             })
 
-        final_df = pd.DataFrame(final_rows)
+    # ==============================
+    # UNIFIED FINAL TABLE ASSEMBLY
+    # ==============================
+
+    # Build LLM decision map by account name
+    llm_map = {}
+
+    for item in llm_results:
+        row = ambiguous.iloc[item["id"]]
+
+        sub_id = None if item["subgroup_id"] == "NONE" else int(item["subgroup_id"])
+
+        llm_map[row["Account Name"]] = {
+            "subgroup_id": sub_id,
+            "rationale": item["rationale"],
+            "confidence": item["confidence"],
+        }
+
+
+    final_records = []
+
+    for _, row in df.iterrows():
+
+        account_name = row["Account Name"]
+
+        # ---------- If row went to LLM ----------
+        if account_name in llm_map:
+
+            decision = llm_map[account_name]
+            sub_id = decision["subgroup_id"]
+
+            lookup = subgroup_lookup.get(sub_id, {}) if sub_id else {}
+
+            final_records.append({
+                **row.to_dict(),
+                "Chosen Subgroup": lookup.get("subgroup_name", "NONE"),
+                "Group": lookup.get("group"),
+                "Class": lookup.get("class"),
+                "Type": lookup.get("type"),
+                "Confidence": decision["confidence"],
+                "Rationale": decision["rationale"],
+            })
+
+        # ---------- Deterministic path ----------
+        else:
+
+            cand_row = candidate_df[candidate_df["Account Name"] == account_name].iloc[0]
+
+            sub_id_raw = cand_row["Top Candidate ID"]
+
+            sub_id = None if pd.isna(sub_id_raw) else int(sub_id_raw)
+
+            lookup = subgroup_lookup.get(sub_id, {}) if sub_id else {}
+
+            # simple confidence rule
+            gap = cand_row["Score Gap"]
+            confidence = "high" if gap and gap > 0.15 else "moderate"
+
+            final_records.append({
+                **row.to_dict(),
+                "Chosen Subgroup": lookup.get("subgroup_name"),
+                "Group": lookup.get("group"),
+                "Class": lookup.get("class"),
+                "Type": lookup.get("type"),
+                "Confidence": confidence,
+                "Rationale": "Auto-mapped via deterministic signals",
+            })
+
+    final_df = pd.DataFrame(final_records)
 
     st.subheader("Final Mapping Preview")
     st.dataframe(final_df)
