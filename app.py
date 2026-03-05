@@ -368,7 +368,7 @@ Accounts:
 
 industry_context = st.text_input(
     "Company industry (optional - helps classify industry-specific accounts)",
-    value="Construction and infrastructure company. Direct labor, materials, subcontractor costs, permits and site costs are Cost of Revenue. R&M accounts are operating overhead expenses."
+    value="Construction and infrastructure company"
 )
 
 uploaded_file = st.file_uploader("Upload Trial Balance (Excel)", type=["xlsx"])
