@@ -442,6 +442,12 @@ if uploaded_file:
     # SECTION 5: LLM REFEREE (button-triggered, outside status block)
     # ============================================================
 
+    if "final_df" not in st.session_state:
+        st.session_state.final_df = final_df
+
+    if "candidate_rows" not in st.session_state:
+        st.session_state.candidate_rows = candidate_rows
+
     if escalated_count > 0:
         if "llm_run" not in st.session_state:
             st.session_state.llm_run = False
@@ -450,12 +456,12 @@ if uploaded_file:
             st.session_state.llm_run = True
 
         if st.session_state.llm_run:
-            ambiguous_df = final_df[final_df["Escalate to LLM"] == True].copy().reset_index(drop=True)
+            ambiguous_df = final_df[st.session_state.final_df["Escalate to LLM"] == True].copy().reset_index(drop=True)
 
             payload = []
             for i, row in ambiguous_df.iterrows():
                 orig = next(
-                    (x for x in candidate_rows if x["account_name"] == row["Account Name"]),
+                    (x for x in st.session_state.candidate_rows if x["account_name"] == row["Account Name"]),
                     None
                 )
                 if orig is None or not orig["candidates"]:
@@ -592,7 +598,7 @@ Accounts:
     # ============================================================
 
     final_records = []
-    for _, row in final_df.iterrows():
+    for _, row in st.session_state.final_df.iterrows():
         sub_id = row.get("Subgroup ID")
         try:
             sub_id_int = int(sub_id) if sub_id is not None and not pd.isna(sub_id) else None
