@@ -11,7 +11,7 @@ from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
 
 load_dotenv()
-client = OpenAI()
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY"))
 
 st.title("TB Auto Group POC")
 
