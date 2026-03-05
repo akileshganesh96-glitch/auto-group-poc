@@ -3,59 +3,59 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 import json
+import numpy as np
+import re
+import html
+from openai import OpenAI
+from pathlib import Path
+from sklearn.metrics.pairwise import cosine_similarity
 
 load_dotenv()
+client = OpenAI()
 
 st.title("TB Auto Group POC")
 
-# -------------------------------
-# CoA PREPROCESSING (Pass 1)
-# -------------------------------
+# ============================================================
+# SECTION 1: CoA PREPROCESSING (runs once on startup)
+# ============================================================
 
-from pathlib import Path
-
-# Path to fixed CoA file
 BASE_DIR = Path(__file__).resolve().parent
 coa_path = BASE_DIR / "data" / "data" / "Univ Grouping List Sample.xlsx"
+embedding_path = BASE_DIR / "data" / "coa_subgroup_embeddings.json"
 
-# Load raw CoA
+with open(embedding_path) as f:
+    subgroup_embeddings = json.load(f)
+
+subgroup_ids = list(subgroup_embeddings.keys())
+subgroup_matrix = np.array(list(subgroup_embeddings.values()))
+
 coa_raw = pd.read_excel(coa_path)
-
-st.subheader("Raw CoA Preview")
-st.dataframe(coa_raw.head())
-
-
-# ---- STEP 1: Keep only valid subgroup rows ----
-# We only want leaf nodes where Subgroup ID and Subgroup name exist
-
 coa_sub = coa_raw.dropna(subset=["Subgroup ID", "Subgroup"]).copy()
 
+coa_sub["Subgroup ID"] = (
+    coa_sub["Subgroup ID"]
+    .astype(str)
+    .str.replace(".0", "", regex=False)
+    .str.strip()
+)
 
-# ---- STEP 2: Normalize subgroup IDs ----
-# Excel often reads numeric IDs as floats (1010.0)
-# We convert everything to string without decimal
+TYPE_NORMALIZATION = {
+    "assets": "asset", "liabilities": "liability",
+    "equities": "equity", "revenues": "revenue", "expenses": "expense"
+}
+coa_sub["Type"] = (
+    coa_sub["Type"].astype(str).str.strip().str.lower()
+    .replace(TYPE_NORMALIZATION)
+)
 
-coa_sub["Subgroup ID"] = coa_sub["Subgroup ID"].astype(str).str.replace(".0", "", regex=False)
-
-
-# ---- STEP 3: Validate duplicates ----
-duplicate_mask = coa_sub["Subgroup ID"].duplicated(keep=False)
-
-duplicates = coa_sub[duplicate_mask]
-
-if len(duplicates) > 0:
-    st.error(f"Duplicate Subgroup IDs detected: {duplicates['Subgroup ID'].nunique()}")
-    st.write("Duplicate rows:")
-    st.dataframe(duplicates[["Subgroup ID", "Subgroup", "Group", "Class", "Type"]])
-else:
-    st.success("No duplicate Subgroup IDs")
-
-
-# ---- STEP 4: Build subgroup lookup table ----
-# This becomes the canonical taxonomy used everywhere
+VALID_TYPES = {"asset", "liability", "equity", "revenue", "expense"}
+invalid_types = coa_sub[~coa_sub["Type"].isin(VALID_TYPES)]
+if len(invalid_types) > 0:
+    st.error("Invalid Type values in CoA:")
+    st.dataframe(invalid_types[["Subgroup ID", "Subgroup", "Type"]])
+    st.stop()
 
 subgroup_lookup = {}
-
 for _, row in coa_sub.iterrows():
     sub_id = int(row["Subgroup ID"])
     subgroup_lookup[sub_id] = {
@@ -65,453 +65,602 @@ for _, row in coa_sub.iterrows():
         "type": row["Type"],
     }
 
-st.write("Sample lookup keys:", list(subgroup_lookup.keys())[:5])
-st.write("Key type:", type(list(subgroup_lookup.keys())[0]))
+def normalize_text(x):
+    return str(x).lower().replace("&", "and").replace("-", " ").strip()
 
-# ---- STEP 5: Create subgroup description text ----
-# This text will later be used for embeddings + LLM context
+subgroup_name_map = {}
+for sid, data in subgroup_lookup.items():
+    normalized = normalize_text(data["subgroup_name"])
+    subgroup_name_map[normalized] = sid
 
-coa_sub["description"] = (
-    coa_sub["Subgroup"]
-    + " — subgroup under "
-    + coa_sub["Group"]
-    + ", "
-    + coa_sub["Class"]
-    + ", "
-    + coa_sub["Type"]
+# ============================================================
+# SECTION 2: HELPER FUNCTIONS (defined once, used inside pipeline)
+# ============================================================
+
+SYNONYM_MAP = {
+    "ar": "accounts receivable",
+    "a r": "accounts receivable",
+    "ap": "accounts payable",
+    "a p": "accounts payable",
+    "debtors": "receivable",
+    "creditors": "payable",
+    "np": "notes payable",
+    "r m": "repairs and maintenance",
+    "fica": "payroll tax social security",
+    "futa": "payroll tax unemployment federal",
+    "mesc": "payroll tax unemployment state",
+    "cos": "cost of sales",
+    "cogs": "cost of goods sold",
+    "pp e": "property plant equipment",
+    "ppe": "property plant equipment",
+}
+
+def preprocess_account_name(raw_name):
+    """Clean real-world TB account names before retrieval or LLM calls."""
+    name = html.unescape(str(raw_name).strip())
+
+    # Strip QuickBooks numeric prefix e.g. "1005 · "
+    name = re.sub(r'^\d+\s*[·•]\s*', '', name)
+
+    # Take last segment of hierarchy path e.g. "Overhead:Accounting" → "Accounting"
+    if ':' in name:
+        name = name.split(':')[-1].strip()
+
+    # Remove entity name suffixes after " - " if suffix looks like a proper noun
+    dash_parts = name.split(' - ')
+    if len(dash_parts) > 1:
+        suffix = dash_parts[-1].strip()
+        suffix_words = suffix.split()
+        if len(suffix_words) >= 2 and all(w[0].isupper() for w in suffix_words if w):
+            name = ' - '.join(dash_parts[:-1]).strip()
+
+    # Remove parentheses e.g. "Gain(Loss)" → "Gain Loss"
+    name = re.sub(r'[()]', ' ', name)
+
+    # Final cleanup
+    name = name.lower()
+    name = re.sub(r'[^a-z0-9\s]', ' ', name)
+    name = ' '.join(name.split())
+    return name
+
+def normalize_synonyms(text):
+    words = text.split()
+    words = [SYNONYM_MAP.get(w, w) for w in words]
+    return " ".join(words)
+
+def classify_types_llm(df_batch, industry_context):
+    """Classify account types using LLM. Returns list of {id, type} dicts."""
+    payload = [
+        {
+            "id": int(idx),
+            "account_number": str(row["Account Number"]),
+            "account_name": str(row["account_name_clean"]),
+            "balance_sign": (
+                "credit" if pd.notna(row["Balance"]) and float(row["Balance"]) < 0
+                else "debit" if pd.notna(row["Balance"]) and float(row["Balance"]) > 0
+                else "zero"
+            )
+        }
+        for idx, row in df_batch.iterrows()
+    ]
+
+    prompt = f"""You are a financial reporting expert with deep knowledge of IFRS and US GAAP.
+
+Industry context: {industry_context}
+Use this to interpret account names that may be industry-specific.
+In construction, costs like materials, subcontractor costs, permits, and site expenses are Cost of Revenue, not operating expenses.
+
+Classify each account into exactly one of these types:
+asset | liability | equity | revenue | expense | unknown
+
+Classification rules:
+- asset: economic resources providing future benefit. Includes contra-assets (accumulated depreciation, allowance for doubtful debts).
+- liability: present obligations requiring future outflow. Includes deferred revenue, tax payables, accruals, VAT payable, GST payable.
+- equity: residual interest after liabilities. Includes share capital, retained earnings, dividends declared, distributions to owners, owner withdrawals.
+- revenue: inflows from operations or gains. Includes sales, service income, interest income, gain on disposal, gain on sale.
+- expense: outflows incurred to generate revenue. Includes cost of sales, salaries, depreciation, interest expense, tax expense, bad debt expense.
+- unknown: ONLY when the account name contains no recognisable accounting terminology whatsoever — for example, a person's name, a property address, or a pure reference code with no descriptive words. If the name contains any accounting term, commit to your best classification.
+
+Critical edge cases — follow these exactly:
+- Dividends Paid, Distributions to Owners, Owner Drawings → EQUITY not expense
+- Deferred Revenue, Unearned Revenue, Advance Billing → LIABILITY not revenue
+- Accumulated Depreciation, Allowance for Doubtful Debts → ASSET (contra-asset)
+- VAT Payable, GST Payable, Sales Tax Payable, Income Tax Payable → LIABILITY
+- Sales Returns, Returns and Allowances, Sales Discounts → REVENUE (contra-revenue)
+- Gain on Disposal, Gain on Sale, Loss on Disposal → REVENUE
+- Intercompany Eliminations, Clearing Accounts, Suspense Accounts → UNKNOWN
+
+Note: account_name has been normalized (lowercase, punctuation removed).
+Account numbers are provided separately for context only.
+
+Return strict JSON array only, no other text:
+[{{"id": 1, "type": "asset"}}, {{"id": 2, "type": "expense"}}]
+
+Accounts to classify:
+{json.dumps(payload, indent=2)}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    text = response.choices[0].message.content.strip()
+
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("["):
+                text = part
+                break
+
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1:
+        text = text[start:end+1]
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        st.warning("Type classification JSON parse failed for a batch.")
+        return []
+
+def build_deterministic_rationale(account_name, subgroup_name, raw_score, type_match, predicted_type):
+    """Explain what drove the deterministic match."""
+    account_words = set(account_name.lower().split())
+    subgroup_words = set(subgroup_name.lower().split())
+    stop = {"and", "or", "the", "a", "an", "of", "for", "in", "on", "to", "other"}
+    common_words = (account_words & subgroup_words) - stop
+
+    score_pct = int(raw_score * 100)
+
+    if common_words:
+        word_match = f"Matched on: {', '.join(sorted(common_words))}"
+    else:
+        word_match = f"Matched via semantic similarity to '{subgroup_name}'"
+
+    type_note = f"Type confirmed as {predicted_type} by LLM"
+    return f"{word_match} | {type_note} | Similarity: {score_pct}%"
+
+# ============================================================
+# SECTION 3: UI — UPLOAD AND INDUSTRY CONTEXT
+# ============================================================
+
+industry_context = st.text_input(
+    "Company industry (optional — helps classify industry-specific accounts)",
+    value="Construction and infrastructure company"
 )
 
-# ---- STEP 6: Show cleaned subgroup universe ----
-st.subheader("Valid Subgroups (Engine Target Space)")
-st.write(f"Total subgroups: {len(coa_sub)}")
-st.dataframe(coa_sub[["Subgroup ID", "Subgroup", "Group", "Class", "Type"]].head())
-
-# ---- User Upload for Trial Balance ----
 uploaded_file = st.file_uploader("Upload Trial Balance (Excel)", type=["xlsx"])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
-    
-    st.subheader("Preview")
-    st.dataframe(df)
 
-# ---- Unified category signal config ----
-    CATEGORY_SIGNALS = {
-        "revenue": {
-            "triggers": ["revenue", "sales"],
-            "hints": ["revenue", "sales"],
-        },
-        "payroll": {
-            "triggers": ["salary", "wages", "payroll"],
-            "hints": ["payroll", "salary", "wages"],
-        },
-        "cogs": {
-            "triggers": ["cost of sales", "cost of goods"],
-            "hints": ["cost of sales", "cost of goods"],
-        },
-        "depreciation": {
-            "triggers": ["depreciation"],
-            "hints": ["depreciation"],
-        },
-        "interest": {
-            "triggers": ["interest"],
-            "hints": ["interest"],
-        },
-        "tax": {
-            "triggers": ["tax"],
-            "hints": ["tax"],
-        },
-        "debt": {
-            "triggers": ["loan", "debt", "borrow", "notes payable"],
-            "hints": ["loan", "debt", "borrow", "notes payable"],
-        },
-        "inventory": {
-            "triggers": ["inventory", "raw", "finished goods"],
-            "hints": ["inventory", "raw", "finished goods"],
-        },
-        "rent": {
-            "triggers": ["rent"],
-            "hints": ["rent"],
-        },
-    }
+    with st.expander("Trial Balance Preview", expanded=False):
+        st.dataframe(df)
 
-# -------------------------------
-# FEATURE EXTRACTION (Pass 2)
-# -------------------------------
-    # Normalize account name for analysis
-    df["account_name_clean"] = (
-        df["Account Name"]
-        .astype(str)
-        .str.lower()
-        .str.replace(r"[^a-z0-9\s]", "", regex=True)
-    )
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("API key missing")
+        st.stop()
 
-    # ---- Keyword detection (very simple starter list) ----
-    def find_keywords(text):
-        found = []
-        for cat in CATEGORY_SIGNALS.values():
-            for w in cat["triggers"]:
-                if w in text:
-                    found.append(w)
-        return found
+    # ============================================================
+    # SECTION 4: MAIN PIPELINE inside st.status
+    # ============================================================
 
-    df["keywords_found"] = df["account_name_clean"].apply(find_keywords)
+    SCORE_THRESHOLD = 0.22
+    GAP_THRESHOLD = 0.01
 
-    # ---- Lifecycle flag ----
-    lifecycle_words = ["prepaid", "accrued", "advance", "deferred"]
+    with st.status("Analysing your Trial Balance...", expanded=True) as status:
 
-    df["lifecycle_flag"] = df["account_name_clean"].apply(
-        lambda x: any(w in x for w in lifecycle_words)
-    )
+        # --- Step 1: Clean account names ---
+        st.write("🧹 Cleaning and normalising account names...")
+        df["account_name_clean"] = df["Account Name"].apply(preprocess_account_name)
+        df["account_name_clean"] = df["account_name_clean"].apply(normalize_synonyms)
+        st.write(f"✅ {len(df)} accounts cleaned and normalised")
 
-    # ---- Generic / low-signal flag ----
-    generic_words = ["misc", "others", "sundry", "general", "clearing", "suspense"]
+        # --- Step 2: Exact lexical match ---
+        st.write("🔎 Checking for exact matches against Chart of Accounts...")
+        df["lexical_subgroup_id"] = None
+        for i, row in df.iterrows():
+            normalized_account = normalize_text(row["account_name_clean"])
+            if normalized_account in subgroup_name_map:
+                df.at[i, "lexical_subgroup_id"] = subgroup_name_map[normalized_account]
 
-    df["low_signal_flag"] = df["account_name_clean"].apply(
-        lambda x: any(w in x for w in generic_words)
-    )
+        lexical_matches = df[df["lexical_subgroup_id"].notna()].copy()
+        remaining_df = df[df["lexical_subgroup_id"].isna()].copy().reset_index(drop=True)
+        st.write(f"✅ {len(lexical_matches)} exact matches found — {len(remaining_df)} accounts proceeding to AI pipeline")
 
-    # ---- Account number band detection (soft) ----
-    df["number_band"] = df["Account Number"].astype(str).str[0]
+        # --- Step 3: LLM type classification ---
+        st.write("🤖 Classifying account types using AI...")
+        all_type_results = []
+        for i in range(0, len(remaining_df), 50):
+            batch = remaining_df.iloc[i:i+50]
+            all_type_results.extend(classify_types_llm(batch, industry_context))
 
-    # ---- Balance direction ----
-    df["balance_direction"] = df["Balance"].apply(
-        lambda x: "debit" if x >= 0 else "credit"
-    )
+        type_map = {r["id"]: r["type"] for r in all_type_results}
+        remaining_df["predicted_type"] = remaining_df.index.map(type_map).fillna("unknown")
 
-    # ---- Anomaly flag (very basic starter logic) ----
-    # Example: credit balance in 1xxx (asset band) looks suspicious
-    df["anomaly_flag"] = (
-        (df["number_band"] == "1") & (df["balance_direction"] == "credit")
-    )
+        type_counts = remaining_df["predicted_type"].value_counts().to_dict()
+        type_summary = ", ".join([f"{v} {k}" for k, v in type_counts.items() if k != "unknown"])
+        pending = type_counts.get("unknown", 0)
+        st.write(f"✅ Type classification complete — {type_summary}, {pending} pending review")
 
-    st.subheader("Feature Extraction Preview")
-    st.dataframe(
-        df[
-            [
-                "Account Number",
-                "Account Name",
-                "Balance",
-                "keywords_found",
-                "lifecycle_flag",
-                "low_signal_flag",
-                "number_band",
-                "balance_direction",
-                "anomaly_flag",
-            ]
-        ].head(20)
-    )
+        # --- Step 4: Semantic embeddings ---
+        st.write("🔍 Generating semantic embeddings for account matching...")
+        account_names = list(remaining_df["account_name_clean"])
+        account_vectors = []
+        for i in range(0, len(account_names), 200):
+            batch = account_names[i:i+200]
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=batch
+            )
+            for emb in response.data:
+                account_vectors.append(emb.embedding)
+        account_vectors = np.array(account_vectors)
+        similarity_matrix = cosine_similarity(account_vectors, subgroup_matrix)
+        st.write(f"✅ Embeddings complete — matching {len(remaining_df)} accounts against {len(coa_sub)} subgroups")
 
-    # -------------------------------
-    # CANDIDATE GENERATION (Lightweight)
-    # -------------------------------
+        # --- Step 5: Candidate generation with soft containment ---
+        st.write("⚖️ Running candidate retrieval and deterministic selection...")
+        candidate_rows = []
 
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    import numpy as np
+        for vec_idx, (df_idx, row) in enumerate(remaining_df.iterrows()):
+            sims = similarity_matrix[vec_idx]
+            scores = sims.copy()
+            predicted_type = row["predicted_type"]
 
-    # Prepare subgroup texts (from CoA preprocessing)
-    subgroup_texts = coa_sub["description"].tolist()
-    subgroup_ids = coa_sub["Subgroup ID"].tolist()
-    subgroup_names = coa_sub["Subgroup"].tolist()
+            # Soft containment — boost candidates matching predicted type
+            if predicted_type in VALID_TYPES:
+                for i, sid in enumerate(subgroup_ids):
+                    cand_type = subgroup_lookup[int(sid)]["type"]
+                    if cand_type == predicted_type:
+                        scores[i] *= 2.0
 
-    # Fit TF-IDF on subgroup descriptions once
-    vectorizer = TfidfVectorizer()
-    subgroup_matrix = vectorizer.fit_transform(subgroup_texts)
+            top_idx = np.argsort(scores)[-7:][::-1]
+            candidates = []
 
-    candidate_rows = []
+            for i in top_idx:
+                subgroup_id = int(subgroup_ids[i])
+                raw_score = float(sims[i])
+                boosted_score = float(scores[i])
+                cand_type = subgroup_lookup[subgroup_id]["type"]
 
-    for _, row in df.iterrows():
+                candidates.append({
+                    "subgroup_id": subgroup_id,
+                    "subgroup_name": subgroup_lookup[subgroup_id]["subgroup_name"],
+                    "score": boosted_score,
+                    "raw_score": raw_score,
+                    "type": cand_type,
+                    "type_match": cand_type == predicted_type
+                })
 
-        account_text = row["account_name_clean"]
-
-        acc_vec = vectorizer.transform([account_text])
-
-        # Cosine similarity
-        sims = (subgroup_matrix @ acc_vec.T).toarray().ravel()
-
-        # Top 5 candidates
-        top_idx = np.argsort(sims)[-5:][::-1]
-
-        candidates = []
-
-        for idx in top_idx:
-            
-            candidates.append({
-                "subgroup_id": subgroup_ids[idx],
-                "subgroup_name": subgroup_names[idx],
-                "score": float(sims[idx])   # ✅ base score
-            })
-            
-        # ---- Category recall guardrail ----
-        extra_candidates = []
-
-        for cat in CATEGORY_SIGNALS.values():
-            if any(t in account_text for t in cat["triggers"]):
-                # ensure subgroup with hint words appears in candidates
-                for idx2, name in enumerate(subgroup_names):
-                    if any(h in name.lower() for h in cat["hints"]):
-                        extra_candidates.append({
-                            "subgroup_id": subgroup_ids[idx2],
-                            "subgroup_name": subgroup_names[idx2],
-                            "score": 0.05  # small base score so it survives shortlist
-                        })
-
-        # Add only a few to avoid flooding
-        candidates.extend(extra_candidates[:2])
-
-        # dedupe
-        seen = {}
-        for c in candidates:
-            sid = c["subgroup_id"]
-            if sid not in seen or c["score"] > seen[sid]["score"]:
-                seen[sid] = c
-        candidates = list(seen.values())
-
-        # ranking loop with category and lifecycle boosts
-        for c in candidates:
-
-            idx_name = c["subgroup_name"].lower()
-
-            # category boost
-            for cat in CATEGORY_SIGNALS.values():
-                if any(t in account_text for t in cat["triggers"]):
-                    if any(h in idx_name for h in cat["hints"]):
-                        c["score"] += 0.25
-
-            # lifecycle boost
-            if row["lifecycle_flag"]:
-                if any(w in idx_name for w in ["prepaid", "accrued", "deferred"]):
-                    c["score"] += 0.2
-        
-        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-
-        score_gap = None
-        if len(candidates) > 1:
-            score_gap = candidates[0]["score"] - candidates[1]["score"]
-
-        candidate_rows.append({
-            "Account Name": row["Account Name"],
-            "Top Candidate": candidates[0]["subgroup_name"],
-            "Top Candidate ID": candidates[0]["subgroup_id"],
-            "Top Score": candidates[0]["score"],
-            "Score Gap": score_gap,
-            "All Candidates": [
-                {"id": c["subgroup_id"], "name": c["subgroup_name"]}
-                for c in candidates
-            ]
-        })
-
-    candidate_df = pd.DataFrame(candidate_rows)
-
-    st.subheader("Candidate Generation Preview")
-    st.dataframe(candidate_df.head(20))
-    
-    st.write("API key loaded:", bool(os.getenv("OPENAI_API_KEY")))
-
-    from openai import OpenAI
-
-    client = OpenAI()
-
-
-    # ---- Pick ambiguous rows only ----
-    ambiguous = candidate_df[candidate_df["Score Gap"] < 0.1].copy().reset_index(drop=True)
-
-    st.write(f"Ambiguous rows sent to LLM: {len(ambiguous)}")
-    st.write("First ambiguous candidate IDs:",
-         [c["id"] for c in ambiguous.iloc[0]["All Candidates"]])
-
-    # ---- Structured LLM referee ----
-
-    def build_batch_payload(rows):
-        payload = []
-
-        for i, r in rows.iterrows():
-            payload.append({
-                "id": int(i),
-                "account": r["Account Name"],
-                "candidates": r["All Candidates"]  # now id+name
+            candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+            candidate_rows.append({
+                "account_number": row["Account Number"],
+                "account_name": row["Account Name"],
+                "balance": row.get("Balance"),
+                "predicted_type": predicted_type,
+                "candidates": candidates
             })
 
-        return payload
-
-    llm_results = []
-
-    if len(ambiguous) > 0:
-
-        if not os.getenv("OPENAI_API_KEY"):
-            st.error("API key missing — LLM disabled")
-            st.stop()
-          
-        payload = build_batch_payload(ambiguous)
-
-        prompt = f"""
-        You are an accounting expert.
-
-        For each item choose the best subgroup from candidates.
-        If none fit, subgroup = NONE.
-
-        Return JSON array with:
-        id
-        subgroup_id (must be EXACTLY one of candidate ids or NONE)
-        confidence (high, moderate, low)
-        rationale (one short sentence explaining why this candidate is best fit for the account.)
-        Choose using subgroup_id, not subgroup name.
-
-        Data:
-        {payload}
-        """
-
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            input=prompt
-        )
-
-        text = ""
-
-        for item in response.output:
-            if item.type == "message":
-                for c in item.content:
-                    if c.type == "output_text":
-                        text += c.text
-
-        # Parse JSON (no markdown cleaning needed now)
-        st.subheader("Structured LLM Response")
-        st.code(text, language="json")
-        
-        clean_text = text.strip()
-
-        if clean_text.startswith("```"):
-            clean_text = clean_text.split("```")[1]
-            if clean_text.startswith("json"):
-                clean_text = clean_text[4:].strip()
-
-        try:
-            llm_results = json.loads(clean_text)
-        except:
-            llm_results = []   
-
-        def compute_confidence(score_gap, subgroup, low_signal):
-
-            if subgroup == "NONE":
-                return "low"
-
-            if score_gap is not None and score_gap > 0.15:
-                return "high"
-
-            if low_signal:
-                return "low"
-
-            return "moderate"
-
+        # --- Step 6: Deterministic selection ---
         final_rows = []
 
-        for item in llm_results:
+        for row in candidate_rows:
+            candidates = row["candidates"]
+            predicted_type = row["predicted_type"]
 
-            row = ambiguous.loc[item["id"]]
+            if predicted_type == "unknown" or predicted_type not in VALID_TYPES:
+                final_rows.append({
+                    "Account Number": row["account_number"],
+                    "Account Name": row["account_name"],
+                    "Balance": row.get("balance"),
+                    "Predicted Type": predicted_type,
+                    "Selected Subgroup": None,
+                    "Subgroup ID": None,
+                    "Confidence": "low",
+                    "Escalate to LLM": False,
+                    "Rationale": "Type could not be determined — flagged for manual review"
+                })
+                continue
 
-            confidence = compute_confidence(
-                row["Score Gap"],
-                item["subgroup_id"],
-                row.get("low_signal_flag", False)
-            )
+            if not candidates:
+                final_rows.append({
+                    "Account Number": row["account_number"],
+                    "Account Name": row["account_name"],
+                    "Balance": row.get("balance"),
+                    "Predicted Type": predicted_type,
+                    "Selected Subgroup": None,
+                    "Subgroup ID": None,
+                    "Confidence": "low",
+                    "Escalate to LLM": True,
+                    "Rationale": "No subgroup candidates found — escalated for review"
+                })
+                continue
 
-           # normalize ID coming from LLM
-            sub_id = item["subgroup_id"]
+            top1 = candidates[0]
+            top2 = candidates[1] if len(candidates) > 1 else None
+            gap = (top1["score"] - top2["score"]) if top2 else None
 
-            if sub_id == "NONE":
-                sub_id_int = None
+            if top1["score"] < SCORE_THRESHOLD * 2:
+                escalate = True
+                confidence = "low"
+            elif gap is not None and gap < GAP_THRESHOLD:
+                escalate = True
+                confidence = "moderate"
             else:
-                sub_id_int = int(sub_id)
+                escalate = False
+                confidence = "high"
 
-            st.write("Chosen ID:", sub_id_int)
-            st.write("Exists in lookup:", sub_id_int in subgroup_lookup)
-
-            # resolve name via lookup
-            sub_name = (
-                "NONE"
-                if sub_id_int is None
-                else subgroup_lookup.get(sub_id_int, {}).get("subgroup_name", "UNKNOWN")
+            rationale = (
+                build_deterministic_rationale(
+                    row["account_name"], top1["subgroup_name"],
+                    top1["raw_score"], top1["type_match"], predicted_type
+                )
+                if not escalate
+                else "Score gap too narrow — escalated to AI referee for disambiguation"
             )
 
-            # append row
             final_rows.append({
-                "Account": row["Account Name"],
-                "Chosen Subgroup": sub_name,
-                "Subgroup ID": "NONE" if sub_id_int is None else sub_id_int,
+                "Account Number": row["account_number"],
+                "Account Name": row["account_name"],
+                "Balance": row.get("balance"),
+                "Predicted Type": predicted_type,
+                "Selected Subgroup": top1["subgroup_name"],
+                "Subgroup ID": top1["subgroup_id"],
                 "Confidence": confidence,
-                "Rationale": item["rationale"]
+                "Escalate to LLM": escalate,
+                "Rationale": rationale
             })
 
-    # ==============================
-    # UNIFIED FINAL TABLE ASSEMBLY
-    # ==============================
+        final_df = pd.DataFrame(final_rows)
 
-    # Build LLM decision map by account name
-    llm_map = {}
+        escalated_count = int(final_df["Escalate to LLM"].sum())
+        confident_count = len(final_df) - escalated_count
+        st.write(f"✅ Deterministic selection complete — {confident_count} mapped, {escalated_count} escalated to AI referee")
 
-    for item in llm_results:
-        row = ambiguous.iloc[item["id"]]
+        auto_mapped = len(final_df[final_df["Subgroup ID"].notna()])
+        manual_count = len(final_df[final_df["Subgroup ID"].isna()])
 
-        sub_id = None if item["subgroup_id"] == "NONE" else int(item["subgroup_id"])
+        status.update(
+            label=f"✅ First pass complete — {auto_mapped + len(lexical_matches)} accounts mapped, {manual_count} pending AI review or manual review",
+            state="complete",
+            expanded=False
+        )
 
-        llm_map[row["Account Name"]] = {
-            "subgroup_id": sub_id,
-            "rationale": item["rationale"],
-            "confidence": item["confidence"],
-        }
+    # ============================================================
+    # SECTION 5: LLM REFEREE (button-triggered, outside status block)
+    # ============================================================
 
+    if escalated_count > 0:
+        if "llm_run" not in st.session_state:
+            st.session_state.llm_run = False
+
+        if st.button(f"🤖 Run AI Referee for {escalated_count} Ambiguous Accounts"):
+            st.session_state.llm_run = True
+
+        if st.session_state.llm_run:
+            ambiguous_df = final_df[final_df["Escalate to LLM"] == True].copy().reset_index(drop=True)
+
+            payload = []
+            for i, row in ambiguous_df.iterrows():
+                orig = next(
+                    (x for x in candidate_rows if x["account_name"] == row["Account Name"]),
+                    None
+                )
+                if orig is None or not orig["candidates"]:
+                    payload.append({
+                        "id": i,
+                        "account_number": str(row["Account Number"]),
+                        "account_name": row["Account Name"],
+                        "balance_sign": "credit" if pd.notna(orig["balance"] if orig else None) and float(orig["balance"]) < 0 else "debit",
+                        "predicted_type": row["Predicted Type"],
+                        "candidates": []
+                    })
+                    continue
+
+                payload.append({
+                    "id": i,
+                    "account_number": str(row["Account Number"]),
+                    "account_name": row["Account Name"],
+                    "balance": orig.get("balance"),
+                    "predicted_type": row["Predicted Type"],
+                    "candidates": [
+                        {
+                            "subgroup_id": c["subgroup_id"],
+                            "subgroup_name": c["subgroup_name"],
+                            "type": c["type"]
+                        }
+                        for c in orig["candidates"]
+                    ]
+                })
+
+            if payload:
+                with st.spinner("Running AI referee on ambiguous accounts..."):
+                    prompt = f"""You are a senior accountant with expertise in IFRS and US GAAP financial statement preparation.
+
+Industry context: {industry_context}
+
+For each account below, select the most appropriate subgroup from the candidate list.
+
+Rules:
+- You MUST choose from the provided candidates only.
+- Use the account name, account number, balance sign, and predicted type together.
+- A negative balance may indicate a contra account or credit-nature account.
+- If none of the candidates are appropriate, return subgroup_id as "NONE".
+- Do NOT invent subgroup names. Only use the exact subgroup_id values provided.
+
+Return strict JSON array only:
+[
+  {{
+    "id": <id>,
+    "subgroup_id": "<exact id from candidates or NONE>",
+    "confidence": "high|moderate|low",
+    "rationale": "<one sentence: state what the account represents and why this subgroup fits under IFRS/GAAP, under 25 words>"
+  }}
+]
+
+Accounts:
+{json.dumps(payload, indent=2)}"""
+
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        temperature=0,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+
+                    text = response.choices[0].message.content.strip()
+
+                    if "```" in text:
+                        parts = text.split("```")
+                        for part in parts:
+                            part = part.strip()
+                            if part.startswith("json"):
+                                part = part[4:].strip()
+                            if part.startswith("["):
+                                text = part
+                                break
+
+                    start = text.find("[")
+                    end = text.rfind("]")
+                    if start != -1 and end != -1:
+                        text = text[start:end+1]
+
+                    try:
+                        llm_results = json.loads(text)
+                    except json.JSONDecodeError:
+                        llm_results = []
+                        st.error("AI referee JSON parse failed.")
+
+                    for item in llm_results:
+                        idx = item.get("id")
+                        chosen_id = str(item.get("subgroup_id", "NONE"))
+
+                        if idx is None or idx >= len(ambiguous_df):
+                            continue
+
+                        orig = next(
+                            (x for x in candidate_rows
+                             if x["account_name"] == ambiguous_df.loc[idx, "Account Name"]),
+                            None
+                        )
+                        valid_ids = {str(c["subgroup_id"]) for c in orig["candidates"]} if orig else set()
+
+                        if chosen_id == "NONE" or chosen_id not in valid_ids:
+                            ambiguous_df.loc[idx, "Selected Subgroup"] = None
+                            ambiguous_df.loc[idx, "Subgroup ID"] = None
+                            ambiguous_df.loc[idx, "Confidence"] = "low"
+                            ambiguous_df.loc[idx, "Rationale"] = (
+                                "No suitable subgroup found — flagged for manual review"
+                                if chosen_id == "NONE"
+                                else "AI returned invalid candidate — flagged for manual review"
+                            )
+                        else:
+                            sub_id_int = int(chosen_id)
+                            ambiguous_df.loc[idx, "Subgroup ID"] = sub_id_int
+                            ambiguous_df.loc[idx, "Selected Subgroup"] = subgroup_lookup[sub_id_int]["subgroup_name"]
+                            ambiguous_df.loc[idx, "Confidence"] = item.get("confidence", "moderate")
+                            ambiguous_df.loc[idx, "Rationale"] = item.get("rationale", "AI referee decision")
+
+                    # Fallback for any escalated rows with no LLM response
+                    responded_ids = {item.get("id") for item in llm_results}
+                    for i, row in ambiguous_df.iterrows():
+                        if i not in responded_ids:
+                            ambiguous_df.loc[i, "Rationale"] = "Escalated — no AI response received, flagged for manual review"
+                            ambiguous_df.loc[i, "Confidence"] = "low"
+
+                    # Merge back into final_df
+                    for _, resolved_row in ambiguous_df.iterrows():
+                        mask = final_df["Account Name"] == resolved_row["Account Name"]
+                        for col in ["Selected Subgroup", "Subgroup ID", "Confidence", "Rationale"]:
+                            final_df.loc[mask, col] = resolved_row[col]
+
+                st.success(f"✅ AI referee complete")
+
+    # ============================================================
+    # SECTION 6: FINAL TABLE ASSEMBLY
+    # ============================================================
 
     final_records = []
+    for _, row in final_df.iterrows():
+        sub_id = row.get("Subgroup ID")
+        try:
+            sub_id_int = int(sub_id) if sub_id is not None and not pd.isna(sub_id) else None
+        except (ValueError, TypeError):
+            sub_id_int = None
 
-    for _, row in df.iterrows():
+        lookup = subgroup_lookup.get(sub_id_int, {}) if sub_id_int else {}
 
-        account_name = row["Account Name"]
+        final_records.append({
+            "Account Number": row.get("Account Number"),
+            "Account Name": row.get("Account Name"),
+            "Balance": row.get("Balance"),
+            "Type": lookup.get("type") if lookup else row.get("Predicted Type"),
+            "Class": lookup.get("class"),
+            "Group": lookup.get("group"),
+            "Subgroup": lookup.get("subgroup_name"),
+            "Confidence": row.get("Confidence"),
+            "Rationale": row.get("Rationale"),
+        })
 
-        # ---------- If row went to LLM ----------
-        if account_name in llm_map:
+    # Assemble lexical match rows
+    lexical_rows = []
+    for _, row in lexical_matches.iterrows():
+        sid = int(row["lexical_subgroup_id"])
+        lookup = subgroup_lookup[sid]
+        lexical_rows.append({
+            "Account Number": row["Account Number"],
+            "Account Name": row["Account Name"],
+            "Balance": row.get("Balance"),
+            "Type": lookup["type"],
+            "Class": lookup["class"],
+            "Group": lookup["group"],
+            "Subgroup": lookup["subgroup_name"],
+            "Confidence": "high",
+            "Rationale": f"Exact match to '{lookup['subgroup_name']}' in Chart of Accounts",
+        })
 
-            decision = llm_map[account_name]
-            sub_id = decision["subgroup_id"]
+    lexical_df = pd.DataFrame(lexical_rows)
+    ai_output_df = pd.DataFrame(final_records)
+    final_output_df = pd.concat([lexical_df, ai_output_df], ignore_index=True)
 
-            lookup = subgroup_lookup.get(sub_id, {}) if sub_id else {}
+    # ============================================================
+    # SECTION 7: RESULTS DISPLAY
+    # ============================================================
 
-            final_records.append({
-                **row.to_dict(),
-                "Chosen Subgroup": lookup.get("subgroup_name", "NONE"),
-                "Group": lookup.get("group"),
-                "Class": lookup.get("class"),
-                "Type": lookup.get("type"),
-                "Confidence": decision["confidence"],
-                "Rationale": decision["rationale"],
-            })
+    auto_count = final_output_df["Subgroup"].notna().sum()
+    manual_review_count = final_output_df["Subgroup"].isna().sum()
+    high_conf = (final_output_df["Confidence"] == "high").sum()
+    moderate_conf = (final_output_df["Confidence"] == "moderate").sum()
 
-        # ---------- Deterministic path ----------
-        else:
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Accounts", len(final_output_df))
+    col2.metric("Auto-Mapped", auto_count)
+    col3.metric("High Confidence", high_conf)
+    col4.metric("Manual Review", manual_review_count)
 
-            cand_row = candidate_df[candidate_df["Account Name"] == account_name].iloc[0]
+    # Color code confidence column
+    def color_confidence(val):
+        colors = {
+            "high": "background-color: #1a472a; color: #a3d9a5",
+            "moderate": "background-color: #4a3800; color: #ffd966",
+            "low": "background-color: #4a1010; color: #f4a4a4",
+        }
+        return colors.get(val, "")
 
-            sub_id_raw = cand_row["Top Candidate ID"]
+    styled_df = final_output_df.style.applymap(color_confidence, subset=["Confidence"])
 
-            sub_id = None if pd.isna(sub_id_raw) else int(sub_id_raw)
+    st.subheader("Final Mapping")
+    st.dataframe(styled_df, use_container_width=True, height=600)
 
-            lookup = subgroup_lookup.get(sub_id, {}) if sub_id else {}
-
-            # simple confidence rule
-            gap = cand_row["Score Gap"]
-            confidence = "high" if gap and gap > 0.15 else "moderate"
-
-            final_records.append({
-                **row.to_dict(),
-                "Chosen Subgroup": lookup.get("subgroup_name"),
-                "Group": lookup.get("group"),
-                "Class": lookup.get("class"),
-                "Type": lookup.get("type"),
-                "Confidence": confidence,
-                "Rationale": "Auto-mapped via deterministic signals",
-            })
-
-    final_df = pd.DataFrame(final_records)
-
-    st.subheader("Final Mapping Preview")
-    st.dataframe(final_df)
+    csv = final_output_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download Mapping CSV",
+        data=csv,
+        file_name="tb_mapping_output.csv",
+        mime="text/csv"
+    )
