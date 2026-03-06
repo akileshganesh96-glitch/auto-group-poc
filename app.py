@@ -213,7 +213,7 @@ def build_deterministic_rationale(account_name, subgroup_name, raw_score, type_m
     type_desc = f"Classified as {predicted_type}"
     strength = "Strong" if score_pct >= 50 else "Moderate" if score_pct >= 30 else "Weak"
 
-    return f"{match_desc}. {type_desc}. {strength} match at {score_pct}%."
+    return f"{match_desc}. {type_desc} at {score_pct}% similarity."
 
 def run_llm_referee(ambiguous_df, candidate_rows, industry_context):
     """Run LLM referee on ambiguous rows. Returns updated ambiguous_df."""
@@ -515,11 +515,16 @@ if uploaded_file:
             top2 = candidates[1] if len(candidates) > 1 else None
             gap = (top1["score"] - top2["score"]) if top2 else None
 
-            if top1["score"] < SCORE_THRESHOLD * 2:
+            raw = top1["raw_score"]
+
+            if raw < SCORE_THRESHOLD:
                 escalate = True
                 confidence = "low"
             elif gap is not None and gap < GAP_THRESHOLD:
                 escalate = True
+                confidence = "moderate"
+            elif raw < 0.45:
+                escalate = False
                 confidence = "moderate"
             else:
                 escalate = False
