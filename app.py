@@ -104,14 +104,6 @@ SYNONYM_MAP = {
 def preprocess_account_name(raw_name):
     name = html.unescape(str(raw_name).strip())
     name = re.sub(r'^\d+\s*[·•]\s*', '', name)
-    if ':' in name:
-        name = name.split(':')[-1].strip()
-    dash_parts = name.split(' - ')
-    if len(dash_parts) > 1:
-        suffix = dash_parts[-1].strip()
-        suffix_words = suffix.split()
-        if len(suffix_words) >= 2 and all(w[0].isupper() for w in suffix_words if w):
-            name = ' - '.join(dash_parts[:-1]).strip()
     name = re.sub(r'[()]', ' ', name)
     name = name.lower()
     name = re.sub(r'[^a-z0-9\s]', ' ', name)
